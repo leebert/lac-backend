@@ -3,6 +3,8 @@ import { SYSTEM_PROMPT } from "../prompts/system.prompt.js";
 import { buildClarificationPrompt } from "../prompts/clarification.prompt.js";
 import { buildPlanningPrompt } from "../prompts/planning.prompt.js";
 import { buildSummarizationPrompt } from "../prompts/summarization.prompt.js";
+import { CLARIFICATION_SCHEMA } from "../schemas/clarification.schema.js";
+import { PLANNING_SCHEMA } from "../schemas/planning.schema.js";
 import { logAgentDecision, logSummarization } from "../config/logger.js";
 
 const MAX_SESSION_TOKENS = 100000;
@@ -22,7 +24,8 @@ export async function run(session, userMessage) {
 
   const clarification = await generate({
     systemPrompt: SYSTEM_PROMPT,
-    userPrompt: clarificationPrompt
+    userPrompt: clarificationPrompt,
+    responseSchema: CLARIFICATION_SCHEMA
   });
 
   const clarificationTokens = clarification.usage?.totalTokens || 0;
@@ -36,9 +39,9 @@ export async function run(session, userMessage) {
     };
   }
 
-  const clarificationJSON = safeParse(clarification.text);
+  const clarificationData = clarification.json;
 
-  if (clarificationJSON?.needsClarification) {
+  if (clarificationData.needsClarification) {
     logAgentDecision({
       sessionId: session.id,
       decision: 'clarification',
@@ -48,7 +51,7 @@ export async function run(session, userMessage) {
       clarificationTokens
     });
 
-    const agentMessage = clarificationJSON.questions.join("\n");
+    const agentMessage = clarificationData.questions.join("\n");
     session.messages.push({ role: "assistant", content: agentMessage });
     return {
       agentMessage,
@@ -61,7 +64,8 @@ export async function run(session, userMessage) {
 
   const planning = await generate({
     systemPrompt: SYSTEM_PROMPT,
-    userPrompt: planningPrompt
+    userPrompt: planningPrompt,
+    responseSchema: PLANNING_SCHEMA
   });
 
   // Track actual token usage from API
@@ -76,9 +80,9 @@ export async function run(session, userMessage) {
     };
   }
 
-  const planningJSON = safeParse(planning.text);
+  const planningData = planning.json;
 
-  if (planningJSON?.checklist) {
+  if (planningData?.checklist && planningData.checklist.length > 0) {
     logAgentDecision({
       sessionId: session.id,
       decision: 'planning',
@@ -89,13 +93,13 @@ export async function run(session, userMessage) {
       planningTokens
     });
 
-    session.checklist = planningJSON.checklist;
+    session.checklist = planningData.checklist;
 
     const agentMessage = "Here's your checklist:";
     session.messages.push({ role: "assistant", content: agentMessage });
     return {
       agentMessage,
-      checklist: planningJSON.checklist,
+      checklist: planningData.checklist,
       usage: calculateUsageMetrics(session)
     };
   }
@@ -171,12 +175,4 @@ function calculateUsageMetrics(session) {
     remainingBeforeSummarization: Math.round(remainingBeforeSummarization * 10) / 10,
     remainingBeforeLimit: Math.round(remainingBeforeLimit * 10) / 10
   };
-}
-
-function safeParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
 }

@@ -12,18 +12,27 @@ function getClient() {
 export async function generate({
     systemPrompt,
     userPrompt,
-    temperature = 0.3
+    temperature = 0.3,
+    responseSchema = null
 }) {
     const geminiClient = getClient();
     const startTime = Date.now();
     
     try {
+        const config = {
+            temperature
+        };
+
+        // Enable JSON mode when schema is provided
+        if (responseSchema) {
+            config.responseMimeType = "application/json";
+            config.responseSchema = responseSchema;
+        }
+
         const result = await geminiClient.models.generateContent({
             model: "gemini-2.5-flash",
             contents: `${systemPrompt}\n\n${userPrompt}`,
-            config: {
-                temperature
-            }
+            config
         });
 
         // Parse the response
@@ -39,11 +48,14 @@ export async function generate({
             promptTokens: usage?.promptTokenCount,
             candidatesTokens: usage?.candidatesTokenCount,
             totalTokens: usage?.totalTokenCount,
-            model: 'gemini-2.5-flash'
+            model: 'gemini-2.5-flash',
+            usedJsonSchema: !!responseSchema
         });
 
+        // When schema is used, response is guaranteed valid JSON
         return {
             text,
+            json: responseSchema ? JSON.parse(text) : null,
             usage
         };
     } catch (error) {
