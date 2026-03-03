@@ -2,9 +2,11 @@ import { generate } from "../services/gemini.service.js";
 import { SYSTEM_PROMPT } from "../prompts/system.prompt.js";
 import { buildClarificationPrompt } from "../prompts/clarification.prompt.js";
 import { buildPlanningPrompt } from "../prompts/planning.prompt.js";
+import { buildRefinementPrompt } from "../prompts/refinement.prompt.js";
 import { buildSummarizationPrompt } from "../prompts/summarization.prompt.js";
 import { CLARIFICATION_SCHEMA } from "../schemas/clarification.schema.js";
 import { PLANNING_SCHEMA } from "../schemas/planning.schema.js";
+import { REFINEMENT_SCHEMA } from "../schemas/refinement.schema.js";
 import { logAgentDecision, logSummarization } from "../config/logger.js";
 
 const MAX_SESSION_TOKENS = 100000;
@@ -19,6 +21,11 @@ export async function run(session, userMessage) {
     await summarizeOlderMessages(session);
   }
 
+  // Check if planning has been completed - if so, enter refinement mode
+  if (session.checklist && session.checklist.length > 0) {
+    return await handleRefinement(session);
+  }
+
   // Step 1: Clarification Gate
   const clarificationPrompt = buildClarificationPrompt(session);
 
@@ -28,7 +35,7 @@ export async function run(session, userMessage) {
     responseSchema: CLARIFICATION_SCHEMA
   });
 
-  const clarificationTokens = clarification.usage?.totalTokens || 0;
+  const clarificationTokens = clarification.usage?.totalTokenCount || 0;
   session.totalTokens += clarificationTokens;
 
   if (session.totalTokens > MAX_SESSION_TOKENS) {
@@ -69,7 +76,7 @@ export async function run(session, userMessage) {
   });
 
   // Track actual token usage from API
-  const planningTokens = planning.usage?.totalTokens || 0;
+  const planningTokens = planning.usage?.totalTokenCount || 0;
   session.totalTokens += planningTokens;
 
   if (session.totalTokens > MAX_SESSION_TOKENS) {
@@ -95,7 +102,7 @@ export async function run(session, userMessage) {
 
     session.checklist = planningData.checklist;
 
-    const agentMessage = "Here's your checklist:";
+    const agentMessage = "Here's your checklist! Ask me additional questions if you would like me to refine it.";
     session.messages.push({ role: "assistant", content: agentMessage });
     return {
       agentMessage,
@@ -118,6 +125,67 @@ export async function run(session, userMessage) {
   session.messages.push({ role: "assistant", content: planning.text });
   return { 
     agentMessage: planning.text,
+    usage: calculateUsageMetrics(session)
+  };
+}
+
+async function handleRefinement(session) {
+  // Step: Refinement
+  const refinementPrompt = buildRefinementPrompt(session);
+
+  const refinement = await generate({
+    systemPrompt: SYSTEM_PROMPT,
+    userPrompt: refinementPrompt,
+    responseSchema: REFINEMENT_SCHEMA
+  });
+
+  const refinementTokens = refinement.usage?.totalTokenCount || 0;
+  session.totalTokens += refinementTokens;
+
+  if (session.totalTokens > MAX_SESSION_TOKENS) {
+    return {
+      agentMessage:
+        "This session has reached its limit. Please start a new session.",
+      usage: calculateUsageMetrics(session)
+    };
+  }
+
+  const refinementData = refinement.json;
+
+  if (refinementData?.checklist && refinementData.checklist.length > 0) {
+    logAgentDecision({
+      sessionId: session.id,
+      decision: 'refinement',
+      needsClarification: false,
+      hasChecklist: true,
+      tokenUsage: session.totalTokens,
+      refinementTokens
+    });
+
+    session.checklist = refinementData.checklist;
+
+    const agentMessage = "I've refined your checklist based on your feedback. Let me know if you'd like any additional changes!";
+    session.messages.push({ role: "assistant", content: agentMessage });
+    return {
+      agentMessage,
+      checklist: refinementData.checklist,
+      usage: calculateUsageMetrics(session)
+    };
+  }
+
+  // Fallback response
+  logAgentDecision({
+    sessionId: session.id,
+    decision: 'refinement_fallback',
+    needsClarification: false,
+    hasChecklist: false,
+    tokenUsage: session.totalTokens,
+    refinementTokens
+  });
+
+  session.messages.push({ role: "assistant", content: refinement.text });
+  return { 
+    agentMessage: refinement.text,
     usage: calculateUsageMetrics(session)
   };
 }
@@ -147,7 +215,7 @@ async function summarizeOlderMessages(session) {
   });
 
   // Track actual token usage from API
-  const tokensUsed = summary.usage?.totalTokens || 0;
+  const tokensUsed = summary.usage?.totalTokenCount || 0;
   session.totalTokens += tokensUsed;
 
   // Update session with summary and recent messages
@@ -164,6 +232,7 @@ async function summarizeOlderMessages(session) {
 
 function calculateUsageMetrics(session) {
   const currentUsage = session.totalTokens / MAX_SESSION_TOKENS;
+  const summarizationTokenLimit = Math.floor(MAX_SESSION_TOKENS * SUMMARIZATION_THRESHOLD);
   
   // % remaining before summarization
   const remainingBeforeSummarization = Math.max(0, (SUMMARIZATION_THRESHOLD - currentUsage) * 100);
@@ -173,6 +242,9 @@ function calculateUsageMetrics(session) {
   
   return {
     remainingBeforeSummarization: Math.round(remainingBeforeSummarization * 10) / 10,
-    remainingBeforeLimit: Math.round(remainingBeforeLimit * 10) / 10
+    remainingBeforeLimit: Math.round(remainingBeforeLimit * 10) / 10,
+    currentTokens: session.totalTokens,
+    maxTokens: MAX_SESSION_TOKENS,
+    summarizationThreshold: summarizationTokenLimit
   };
 }
