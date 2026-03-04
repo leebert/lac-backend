@@ -13,7 +13,7 @@ const MAX_SESSION_TOKENS = 100000;
 const SUMMARIZATION_THRESHOLD = 0.7;
 const KEEP_RECENT_MESSAGES = 5;
 
-export async function run(session, userMessage) {
+export async function run(session, userMessage, modeEmitter = null) {
   session.messages.push({ role: "user", content: userMessage });
 
   // Check if we need to summarize
@@ -23,10 +23,12 @@ export async function run(session, userMessage) {
 
   // Check if planning has been completed - if so, enter refinement mode
   if (session.checklist && session.checklist.length > 0) {
-    return await handleRefinement(session);
+    if (modeEmitter) modeEmitter('refinement');
+    return await handleRefinement(session, modeEmitter);
   }
 
   // Step 1: Clarification Gate
+  if (modeEmitter) modeEmitter('clarification');
   const clarificationPrompt = buildClarificationPrompt(session);
 
   const clarification = await generate({
@@ -55,7 +57,8 @@ export async function run(session, userMessage) {
       needsClarification: true,
       hasChecklist: false,
       tokenUsage: session.totalTokens,
-      clarificationTokens
+      clarificationTokens,
+      hasModeEmitter: !!modeEmitter
     });
 
     const agentMessage = clarificationData.questions.join("\n");
@@ -67,6 +70,7 @@ export async function run(session, userMessage) {
   }
 
   // Step 2: Planning
+  if (modeEmitter) modeEmitter('planning');
   const planningPrompt = buildPlanningPrompt(session);
 
   const planning = await generate({
@@ -97,7 +101,8 @@ export async function run(session, userMessage) {
       hasChecklist: true,
       tokenUsage: session.totalTokens,
       clarificationTokens,
-      planningTokens
+      planningTokens,
+      hasModeEmitter: !!modeEmitter
     });
 
     session.checklist = planningData.checklist;
@@ -119,7 +124,8 @@ export async function run(session, userMessage) {
     hasChecklist: false,
     tokenUsage: session.totalTokens,
     clarificationTokens,
-    planningTokens
+    planningTokens,
+    hasModeEmitter: !!modeEmitter
   });
 
   session.messages.push({ role: "assistant", content: planning.text });
@@ -129,7 +135,7 @@ export async function run(session, userMessage) {
   };
 }
 
-async function handleRefinement(session) {
+async function handleRefinement(session, modeEmitter = null) {
   // Step: Refinement
   const refinementPrompt = buildRefinementPrompt(session);
 
@@ -159,7 +165,8 @@ async function handleRefinement(session) {
       needsClarification: false,
       hasChecklist: true,
       tokenUsage: session.totalTokens,
-      refinementTokens
+      refinementTokens,
+      hasModeEmitter: !!modeEmitter
     });
 
     session.checklist = refinementData.checklist;
@@ -180,7 +187,8 @@ async function handleRefinement(session) {
     needsClarification: false,
     hasChecklist: false,
     tokenUsage: session.totalTokens,
-    refinementTokens
+    refinementTokens,
+    hasModeEmitter: !!modeEmitter
   });
 
   session.messages.push({ role: "assistant", content: refinement.text });

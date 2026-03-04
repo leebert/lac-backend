@@ -2,9 +2,10 @@ import * as lifeAdminAgent from "../agents/lac.agent.js";
 import * as sessionService from "./session.service.js";
 import logger from "../config/logger.js";
 
-export async function handleMessage(session, userMessage) {
+export async function handleMessage(session, userMessage, modeEmitter = null) {
   // Handle test messages for frontend testing
   if (userMessage.trim().toUpperCase() === 'TEST CLARIFICATION') {
+    if (modeEmitter) modeEmitter('clarification');
     return {
       agentMessage: "I need some clarification before I can help you:\n\n1. What is your preferred date for this task?\n2. Do you have any budget constraints?\n3. Would you like me to include reminders?",
       usage: {
@@ -18,6 +19,7 @@ export async function handleMessage(session, userMessage) {
   }
 
   if (userMessage.trim().toUpperCase() === 'TEST PLANNING') {
+    if (modeEmitter) modeEmitter('planning');
     return {
       agentMessage: "Here's your checklist! Ask me additional questions if you would like me to refine it.",
       checklist: [
@@ -54,6 +56,7 @@ export async function handleMessage(session, userMessage) {
   }
 
   if (userMessage.trim().toUpperCase() === 'TEST REFINEMENT') {
+    if (modeEmitter) modeEmitter('refinement');
     return {
       agentMessage: "I've refined your checklist based on your feedback. Let me know if you'd like any additional changes!",
       checklist: [
@@ -97,6 +100,7 @@ export async function handleMessage(session, userMessage) {
   }
 
   if (userMessage.trim().toUpperCase() === 'TEST ERROR') {
+    if (modeEmitter) modeEmitter('error');
     return {
       agentMessage: "An error occurred while processing your request. Please try again.",
       error: "This is a simulated error for frontend error handling",
@@ -110,7 +114,7 @@ export async function handleMessage(session, userMessage) {
     };
   }
 
-  const response = await lifeAdminAgent.run(session, userMessage);
+  const response = await lifeAdminAgent.run(session, userMessage, modeEmitter);
 
   await sessionService.update(session);
 
@@ -119,6 +123,7 @@ export async function handleMessage(session, userMessage) {
     message: 'Session state after handleMessage',
     category: 'DEBUG_SESSION_STATE',
     sessionId: session.id,
+    hasModeEmitter: !!modeEmitter,
     sessionState: {
       messageCount: session.messages.length,
       totalTokens: session.totalTokens,
