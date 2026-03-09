@@ -12,7 +12,9 @@ export async function create() {
     contextSummary: "",
     messages: [],
     checklist: [],
-    totalTokens: 0
+    totalTokens: 0,
+    tokensSinceLastSummarization: 0,
+    summarizationCount: 0
   };
 
   sessions.set(id, session);

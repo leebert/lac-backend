@@ -7,19 +7,15 @@ import { buildSummarizationPrompt } from "../prompts/summarization.prompt.js";
 import { CLARIFICATION_SCHEMA } from "../schemas/clarification.schema.js";
 import { PLANNING_SCHEMA } from "../schemas/planning.schema.js";
 import { REFINEMENT_SCHEMA } from "../schemas/refinement.schema.js";
-import { logAgentDecision, logSummarization } from "../config/logger.js";
+import { logAgentDecision, logSummarization, logSummarizationCheck } from "../config/logger.js";
 
-const MAX_SESSION_TOKENS = 100000;
-const SUMMARIZATION_THRESHOLD = 0.7;
+const IS_DEV = process.env.NODE_ENV === 'development';
+const MAX_SESSION_TOKENS = IS_DEV ? 50000 : 100000; //Update to 10000 tokens when in local dev mode
+const SUMMARIZATION_THRESHOLD = IS_DEV ? 0.1 : 0.7; //Update to 0.15 % when in local dev mode
 const KEEP_RECENT_MESSAGES = 5;
 
 export async function run(session, userMessage, modeEmitter = null) {
   session.messages.push({ role: "user", content: userMessage });
-
-  // Check if we need to summarize
-  if (shouldSummarize(session)) {
-    await summarizeOlderMessages(session);
-  }
 
   // Check if planning has been completed - if so, enter refinement mode
   if (session.checklist && session.checklist.length > 0) {
@@ -39,6 +35,7 @@ export async function run(session, userMessage, modeEmitter = null) {
 
   const clarificationTokens = clarification.usage?.totalTokenCount || 0;
   session.totalTokens += clarificationTokens;
+  session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + clarificationTokens;
 
   if (session.totalTokens > MAX_SESSION_TOKENS) {
     return {
@@ -63,6 +60,12 @@ export async function run(session, userMessage, modeEmitter = null) {
 
     const agentMessage = clarificationData.questions.join("\n");
     session.messages.push({ role: "assistant", content: agentMessage });
+    
+    // Check if we need to summarize after this interaction
+    if (shouldSummarize(session)) {
+      await summarizeOlderMessages(session);
+    }
+    
     return {
       agentMessage,
       usage: calculateUsageMetrics(session)
@@ -82,6 +85,7 @@ export async function run(session, userMessage, modeEmitter = null) {
   // Track actual token usage from API
   const planningTokens = planning.usage?.totalTokenCount || 0;
   session.totalTokens += planningTokens;
+  session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + planningTokens;
 
   if (session.totalTokens > MAX_SESSION_TOKENS) {
     return {
@@ -109,6 +113,12 @@ export async function run(session, userMessage, modeEmitter = null) {
 
     const agentMessage = "Here's your checklist! Ask me additional questions if you would like me to refine it.";
     session.messages.push({ role: "assistant", content: agentMessage });
+    
+    // Check if we need to summarize after this interaction
+    if (shouldSummarize(session)) {
+      await summarizeOlderMessages(session);
+    }
+    
     return {
       agentMessage,
       checklist: planningData.checklist,
@@ -129,6 +139,12 @@ export async function run(session, userMessage, modeEmitter = null) {
   });
 
   session.messages.push({ role: "assistant", content: planning.text });
+  
+  // Check if we need to summarize after this interaction
+  if (shouldSummarize(session)) {
+    await summarizeOlderMessages(session);
+  }
+  
   return { 
     agentMessage: planning.text,
     usage: calculateUsageMetrics(session)
@@ -147,6 +163,7 @@ async function handleRefinement(session, modeEmitter = null) {
 
   const refinementTokens = refinement.usage?.totalTokenCount || 0;
   session.totalTokens += refinementTokens;
+  session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + refinementTokens;
 
   if (session.totalTokens > MAX_SESSION_TOKENS) {
     return {
@@ -173,6 +190,12 @@ async function handleRefinement(session, modeEmitter = null) {
 
     const agentMessage = "I've refined your checklist based on your feedback. Let me know if you'd like any additional changes!";
     session.messages.push({ role: "assistant", content: agentMessage });
+    
+    // Check if we need to summarize after this interaction
+    if (shouldSummarize(session)) {
+      await summarizeOlderMessages(session);
+    }
+    
     return {
       agentMessage,
       checklist: refinementData.checklist,
@@ -192,6 +215,12 @@ async function handleRefinement(session, modeEmitter = null) {
   });
 
   session.messages.push({ role: "assistant", content: refinement.text });
+  
+  // Check if we need to summarize after this interaction
+  if (shouldSummarize(session)) {
+    await summarizeOlderMessages(session);
+  }
+  
   return { 
     agentMessage: refinement.text,
     usage: calculateUsageMetrics(session)
@@ -200,8 +229,24 @@ async function handleRefinement(session, modeEmitter = null) {
 
 function shouldSummarize(session) {
   // Don't summarize if we already have a summary and only recent messages
-  const tokenUsageRatio = session.totalTokens / MAX_SESSION_TOKENS;
-  return tokenUsageRatio >= SUMMARIZATION_THRESHOLD && session.messages.length > KEEP_RECENT_MESSAGES;
+  const tokensSinceSummarization = session.tokensSinceLastSummarization || session.totalTokens;
+  const tokenUsageRatio = tokensSinceSummarization / MAX_SESSION_TOKENS;
+  const result = tokenUsageRatio >= SUMMARIZATION_THRESHOLD && session.messages.length > KEEP_RECENT_MESSAGES;
+  
+  // Log the check for debugging
+  logSummarizationCheck({
+    sessionId: session.id,
+    tokensSinceSummarization,
+    totalTokens: session.totalTokens,
+    maxTokens: MAX_SESSION_TOKENS,
+    threshold: SUMMARIZATION_THRESHOLD,
+    tokenUsageRatio,
+    messageCount: session.messages.length,
+    keepRecentMessages: KEEP_RECENT_MESSAGES,
+    shouldSummarize: result
+  });
+  
+  return result;
 }
 
 async function summarizeOlderMessages(session) {
@@ -225,25 +270,30 @@ async function summarizeOlderMessages(session) {
   // Track actual token usage from API
   const tokensUsed = summary.usage?.totalTokenCount || 0;
   session.totalTokens += tokensUsed;
+  session.tokensSinceLastSummarization = tokensUsed; // Reset to just the tokens used for summarization
 
   // Update session with summary and recent messages
   session.contextSummary = summary.text;
   session.messages = recentMessages;
+  session.summarizationCount = (session.summarizationCount || 0) + 1;
 
   logSummarization({
     sessionId: session.id,
     messagesBeforeSummarization,
     messagesAfterSummarization: recentMessages.length,
-    tokensUsed
+    tokensUsed,
+    summarizationCount: session.summarizationCount
   });
 }
 
 function calculateUsageMetrics(session) {
   const currentUsage = session.totalTokens / MAX_SESSION_TOKENS;
+  const tokensSinceSummarization = session.tokensSinceLastSummarization || session.totalTokens;
+  const currentSummarizationUsage = tokensSinceSummarization / MAX_SESSION_TOKENS;
   const summarizationTokenLimit = Math.floor(MAX_SESSION_TOKENS * SUMMARIZATION_THRESHOLD);
   
-  // % remaining before summarization
-  const remainingBeforeSummarization = Math.max(0, (SUMMARIZATION_THRESHOLD - currentUsage) * 100);
+  // % remaining before summarization (based on tokens since last summarization)
+  const remainingBeforeSummarization = Math.max(0, (SUMMARIZATION_THRESHOLD - currentSummarizationUsage) * 100);
   
   // % remaining before running out
   const remainingBeforeLimit = Math.max(0, (1 - currentUsage) * 100);
@@ -253,6 +303,7 @@ function calculateUsageMetrics(session) {
     remainingBeforeLimit: Math.round(remainingBeforeLimit * 10) / 10,
     currentTokens: session.totalTokens,
     maxTokens: MAX_SESSION_TOKENS,
-    summarizationThreshold: summarizationTokenLimit
+    summarizationThreshold: summarizationTokenLimit,
+    summarizationCount: session.summarizationCount || 0
   };
 }

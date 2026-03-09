@@ -152,16 +152,53 @@ export function logSummarization({
   sessionId, 
   messagesBeforeSummarization,
   messagesAfterSummarization,
-  tokensUsed 
+  tokensUsed,
+  summarizationCount
 }) {
   logger.info({
-    message: `Session summarized: ${sessionId}`,
+    message: `Session summarized: ${sessionId} (count: ${summarizationCount})`,
     category: 'SESSION_LIFECYCLE',
     event: 'summarization',
     sessionId,
     messagesBeforeSummarization,
     messagesAfterSummarization,
-    tokensUsed
+    tokensUsed,
+    summarizationCount
+  });
+}
+
+/**
+ * Log summarization check details for debugging
+ */
+export function logSummarizationCheck({ 
+  sessionId,
+  tokensSinceSummarization,
+  totalTokens,
+  maxTokens,
+  threshold,
+  tokenUsageRatio,
+  messageCount,
+  keepRecentMessages,
+  shouldSummarize
+}) {
+  logger.info({
+    message: `Summarization check: ${shouldSummarize ? 'TRIGGERED' : 'SKIPPED'}`,
+    category: 'SUMMARIZATION_CHECK',
+    sessionId,
+    tokensSinceSummarization,
+    totalTokens,
+    maxTokens,
+    threshold,
+    tokenUsageRatio: Math.round(tokenUsageRatio * 1000) / 10 + '%',
+    thresholdPercentage: Math.round(threshold * 100) + '%',
+    messageCount,
+    keepRecentMessages,
+    shouldSummarize,
+    reason: shouldSummarize 
+      ? 'Token threshold exceeded and enough messages'
+      : tokenUsageRatio < threshold 
+        ? `Token usage (${Math.round(tokenUsageRatio * 1000) / 10}%) below threshold (${Math.round(threshold * 100)}%)`
+        : `Not enough messages (${messageCount} <= ${keepRecentMessages})`
   });
 }
 
