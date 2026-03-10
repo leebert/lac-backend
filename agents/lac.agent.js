@@ -7,224 +7,300 @@ import { buildSummarizationPrompt } from "../prompts/summarization.prompt.js";
 import { CLARIFICATION_SCHEMA } from "../schemas/clarification.schema.js";
 import { PLANNING_SCHEMA } from "../schemas/planning.schema.js";
 import { REFINEMENT_SCHEMA } from "../schemas/refinement.schema.js";
-import { logAgentDecision, logSummarization, logSummarizationCheck } from "../config/logger.js";
+import { logAgentDecision, logError, logSummarization, logSummarizationCheck } from "../config/logger.js";
 
-const IS_DEV = process.env.NODE_ENV === 'development';
-const MAX_SESSION_TOKENS = IS_DEV ? 50000 : 100000; //Update to 10000 tokens when in local dev mode
-const SUMMARIZATION_THRESHOLD = IS_DEV ? 0.1 : 0.7; //Update to 0.15 % when in local dev mode
+const IS_DEV = !process.env.K_SERVICE && !process.env.FUNCTION_TARGET;
+const MAX_SESSION_TOKENS = IS_DEV ? 10000 : 100000; //Update to 10000 tokens when in local dev mode
+const SUMMARIZATION_THRESHOLD = IS_DEV ? 0.15 : 0.7; //Update to 0.15 % when in local dev mode
 const KEEP_RECENT_MESSAGES = 5;
+
+function extractGeminiErrorMessage(error) {
+  const fallbackMessage = "An error occurred while processing your request. Please try again.";
+
+  if (!error) {
+    return fallbackMessage;
+  }
+
+  const parseErrorPayload = (value) => {
+    if (!value) {
+      return null;
+    }
+
+    if (typeof value === "string") {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return null;
+      }
+    }
+
+    if (typeof value === "object") {
+      return value;
+    }
+
+    return null;
+  };
+
+  const parsedError = parseErrorPayload(error?.message) || parseErrorPayload(error);
+  const providerMessage = parsedError?.error?.message || parsedError?.message;
+
+  return providerMessage || error.message || fallbackMessage;
+}
+
+function buildErrorResponse(session, error, phase) {
+  const errorMessage = extractGeminiErrorMessage(error);
+  const normalizedError = error instanceof Error ? error : new Error(errorMessage);
+
+  logError({
+    error: normalizedError,
+    endpoint: "agent.run",
+    errorType: "gemini_error",
+    sessionId: session.id,
+    context: {
+      phase,
+      providerMessage: errorMessage
+    }
+  });
+
+  return {
+    agentMessage: "An error occurred while processing your request. Please try again.",
+    error: errorMessage,
+    usage: calculateUsageMetrics(session)
+  };
+}
+
+async function summarizeIfNeeded(session) {
+  if (!shouldSummarize(session)) {
+    return null;
+  }
+
+  try {
+    await summarizeOlderMessages(session);
+    return null;
+  } catch (error) {
+    return buildErrorResponse(session, error, "summarization");
+  }
+}
 
 export async function run(session, userMessage, modeEmitter = null) {
   session.messages.push({ role: "user", content: userMessage });
 
-  // Check if planning has been completed - if so, enter refinement mode
-  if (session.checklist && session.checklist.length > 0) {
-    if (modeEmitter) modeEmitter('refinement');
-    return await handleRefinement(session, modeEmitter);
-  }
+  try {
+    // Check if planning has been completed - if so, enter refinement mode
+    if (session.checklist && session.checklist.length > 0) {
+      if (modeEmitter) modeEmitter('refinement');
+      return await handleRefinement(session, modeEmitter);
+    }
 
-  // Step 1: Clarification Gate
-  if (modeEmitter) modeEmitter('clarification');
-  const clarificationPrompt = buildClarificationPrompt(session);
+    // Step 1: Clarification Gate
+    if (modeEmitter) modeEmitter('clarification');
+    const clarificationPrompt = buildClarificationPrompt(session);
 
-  const clarification = await generate({
-    systemPrompt: SYSTEM_PROMPT,
-    userPrompt: clarificationPrompt,
-    responseSchema: CLARIFICATION_SCHEMA
-  });
-
-  const clarificationTokens = clarification.usage?.totalTokenCount || 0;
-  session.totalTokens += clarificationTokens;
-  session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + clarificationTokens;
-
-  if (session.totalTokens > MAX_SESSION_TOKENS) {
-    return {
-      agentMessage:
-        "This session has reached its limit. Please start a new session.",
-      usage: calculateUsageMetrics(session)
-    };
-  }
-
-  const clarificationData = clarification.json;
-
-  if (clarificationData.needsClarification) {
-    logAgentDecision({
-      sessionId: session.id,
-      decision: 'clarification',
-      needsClarification: true,
-      hasChecklist: false,
-      tokenUsage: session.totalTokens,
-      clarificationTokens,
-      hasModeEmitter: !!modeEmitter
+    const clarification = await generate({
+      systemPrompt: SYSTEM_PROMPT,
+      userPrompt: clarificationPrompt,
+      responseSchema: CLARIFICATION_SCHEMA
     });
 
-    const agentMessage = clarificationData.questions.join("\n");
-    session.messages.push({ role: "assistant", content: agentMessage });
-    
-    // Check if we need to summarize after this interaction
-    if (shouldSummarize(session)) {
-      await summarizeOlderMessages(session);
+    const clarificationTokens = clarification.usage?.totalTokenCount || 0;
+    session.totalTokens += clarificationTokens;
+    session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + clarificationTokens;
+
+    if (session.totalTokens > MAX_SESSION_TOKENS) {
+      return {
+        agentMessage:
+          "This session has reached its limit. Please start a new session.",
+        usage: calculateUsageMetrics(session)
+      };
     }
-    
-    return {
-      agentMessage,
-      usage: calculateUsageMetrics(session)
-    };
-  }
 
-  // Step 2: Planning
-  if (modeEmitter) modeEmitter('planning');
-  const planningPrompt = buildPlanningPrompt(session);
+    const clarificationData = clarification.json;
 
-  const planning = await generate({
-    systemPrompt: SYSTEM_PROMPT,
-    userPrompt: planningPrompt,
-    responseSchema: PLANNING_SCHEMA
-  });
+    if (clarificationData.needsClarification) {
+      logAgentDecision({
+        sessionId: session.id,
+        decision: 'clarification',
+        needsClarification: true,
+        hasChecklist: false,
+        tokenUsage: session.totalTokens,
+        clarificationTokens,
+        hasModeEmitter: !!modeEmitter
+      });
 
-  // Track actual token usage from API
-  const planningTokens = planning.usage?.totalTokenCount || 0;
-  session.totalTokens += planningTokens;
-  session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + planningTokens;
+      const agentMessage = clarificationData.questions.join("\n");
+      session.messages.push({ role: "assistant", content: agentMessage });
 
-  if (session.totalTokens > MAX_SESSION_TOKENS) {
-    return {
-      agentMessage:
-        "This session has reached its limit. Please start a new session.",
-      usage: calculateUsageMetrics(session)
-    };
-  }
+      const summarizationError = await summarizeIfNeeded(session);
+      if (summarizationError) {
+        return summarizationError;
+      }
 
-  const planningData = planning.json;
+      return {
+        agentMessage,
+        usage: calculateUsageMetrics(session)
+      };
+    }
 
-  if (planningData?.checklist && planningData.checklist.length > 0) {
+    // Step 2: Planning
+    if (modeEmitter) modeEmitter('planning');
+    const planningPrompt = buildPlanningPrompt(session);
+
+    const planning = await generate({
+      systemPrompt: SYSTEM_PROMPT,
+      userPrompt: planningPrompt,
+      responseSchema: PLANNING_SCHEMA
+    });
+
+    // Track actual token usage from API
+    const planningTokens = planning.usage?.totalTokenCount || 0;
+    session.totalTokens += planningTokens;
+    session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + planningTokens;
+
+    if (session.totalTokens > MAX_SESSION_TOKENS) {
+      return {
+        agentMessage:
+          "This session has reached its limit. Please start a new session.",
+        usage: calculateUsageMetrics(session)
+      };
+    }
+
+    const planningData = planning.json;
+
+    if (planningData?.checklist && planningData.checklist.length > 0) {
+      logAgentDecision({
+        sessionId: session.id,
+        decision: 'planning',
+        needsClarification: false,
+        hasChecklist: true,
+        tokenUsage: session.totalTokens,
+        clarificationTokens,
+        planningTokens,
+        hasModeEmitter: !!modeEmitter
+      });
+
+      session.checklist = planningData.checklist;
+
+      const agentMessage = "Here's your checklist! Ask me additional questions if you would like me to refine it.";
+      session.messages.push({ role: "assistant", content: agentMessage });
+
+      const summarizationError = await summarizeIfNeeded(session);
+      if (summarizationError) {
+        return summarizationError;
+      }
+
+      return {
+        agentMessage,
+        checklist: planningData.checklist,
+        usage: calculateUsageMetrics(session)
+      };
+    }
+
+    // Fallback response
     logAgentDecision({
       sessionId: session.id,
-      decision: 'planning',
+      decision: 'fallback',
       needsClarification: false,
-      hasChecklist: true,
+      hasChecklist: false,
       tokenUsage: session.totalTokens,
       clarificationTokens,
       planningTokens,
       hasModeEmitter: !!modeEmitter
     });
 
-    session.checklist = planningData.checklist;
+    session.messages.push({ role: "assistant", content: planning.text });
 
-    const agentMessage = "Here's your checklist! Ask me additional questions if you would like me to refine it.";
-    session.messages.push({ role: "assistant", content: agentMessage });
-    
-    // Check if we need to summarize after this interaction
-    if (shouldSummarize(session)) {
-      await summarizeOlderMessages(session);
+    const summarizationError = await summarizeIfNeeded(session);
+    if (summarizationError) {
+      return summarizationError;
     }
-    
+
     return {
-      agentMessage,
-      checklist: planningData.checklist,
+      agentMessage: planning.text,
       usage: calculateUsageMetrics(session)
     };
+  } catch (error) {
+    return buildErrorResponse(session, error, "run");
   }
-
-  // Fallback response
-  logAgentDecision({
-    sessionId: session.id,
-    decision: 'fallback',
-    needsClarification: false,
-    hasChecklist: false,
-    tokenUsage: session.totalTokens,
-    clarificationTokens,
-    planningTokens,
-    hasModeEmitter: !!modeEmitter
-  });
-
-  session.messages.push({ role: "assistant", content: planning.text });
-  
-  // Check if we need to summarize after this interaction
-  if (shouldSummarize(session)) {
-    await summarizeOlderMessages(session);
-  }
-  
-  return { 
-    agentMessage: planning.text,
-    usage: calculateUsageMetrics(session)
-  };
 }
 
 async function handleRefinement(session, modeEmitter = null) {
-  // Step: Refinement
-  const refinementPrompt = buildRefinementPrompt(session);
+  try {
+    // Step: Refinement
+    const refinementPrompt = buildRefinementPrompt(session);
 
-  const refinement = await generate({
-    systemPrompt: SYSTEM_PROMPT,
-    userPrompt: refinementPrompt,
-    responseSchema: REFINEMENT_SCHEMA
-  });
+    const refinement = await generate({
+      systemPrompt: SYSTEM_PROMPT,
+      userPrompt: refinementPrompt,
+      responseSchema: REFINEMENT_SCHEMA
+    });
 
-  const refinementTokens = refinement.usage?.totalTokenCount || 0;
-  session.totalTokens += refinementTokens;
-  session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + refinementTokens;
+    const refinementTokens = refinement.usage?.totalTokenCount || 0;
+    session.totalTokens += refinementTokens;
+    session.tokensSinceLastSummarization = (session.tokensSinceLastSummarization || 0) + refinementTokens;
 
-  if (session.totalTokens > MAX_SESSION_TOKENS) {
-    return {
-      agentMessage:
-        "This session has reached its limit. Please start a new session.",
-      usage: calculateUsageMetrics(session)
-    };
-  }
+    if (session.totalTokens > MAX_SESSION_TOKENS) {
+      return {
+        agentMessage:
+          "This session has reached its limit. Please start a new session.",
+        usage: calculateUsageMetrics(session)
+      };
+    }
 
-  const refinementData = refinement.json;
+    const refinementData = refinement.json;
 
-  if (refinementData?.checklist && refinementData.checklist.length > 0) {
+    if (refinementData?.checklist && refinementData.checklist.length > 0) {
+      logAgentDecision({
+        sessionId: session.id,
+        decision: 'refinement',
+        needsClarification: false,
+        hasChecklist: true,
+        tokenUsage: session.totalTokens,
+        refinementTokens,
+        hasModeEmitter: !!modeEmitter
+      });
+
+      session.checklist = refinementData.checklist;
+
+      const agentMessage = "I've refined your checklist based on your feedback. Let me know if you'd like any additional changes!";
+      session.messages.push({ role: "assistant", content: agentMessage });
+
+      const summarizationError = await summarizeIfNeeded(session);
+      if (summarizationError) {
+        return summarizationError;
+      }
+
+      return {
+        agentMessage,
+        checklist: refinementData.checklist,
+        usage: calculateUsageMetrics(session)
+      };
+    }
+
+    // Fallback response
     logAgentDecision({
       sessionId: session.id,
-      decision: 'refinement',
+      decision: 'refinement_fallback',
       needsClarification: false,
-      hasChecklist: true,
+      hasChecklist: false,
       tokenUsage: session.totalTokens,
       refinementTokens,
       hasModeEmitter: !!modeEmitter
     });
 
-    session.checklist = refinementData.checklist;
+    session.messages.push({ role: "assistant", content: refinement.text });
 
-    const agentMessage = "I've refined your checklist based on your feedback. Let me know if you'd like any additional changes!";
-    session.messages.push({ role: "assistant", content: agentMessage });
-    
-    // Check if we need to summarize after this interaction
-    if (shouldSummarize(session)) {
-      await summarizeOlderMessages(session);
+    const summarizationError = await summarizeIfNeeded(session);
+    if (summarizationError) {
+      return summarizationError;
     }
-    
+
     return {
-      agentMessage,
-      checklist: refinementData.checklist,
+      agentMessage: refinement.text,
       usage: calculateUsageMetrics(session)
     };
+  } catch (error) {
+    return buildErrorResponse(session, error, "refinement");
   }
-
-  // Fallback response
-  logAgentDecision({
-    sessionId: session.id,
-    decision: 'refinement_fallback',
-    needsClarification: false,
-    hasChecklist: false,
-    tokenUsage: session.totalTokens,
-    refinementTokens,
-    hasModeEmitter: !!modeEmitter
-  });
-
-  session.messages.push({ role: "assistant", content: refinement.text });
-  
-  // Check if we need to summarize after this interaction
-  if (shouldSummarize(session)) {
-    await summarizeOlderMessages(session);
-  }
-  
-  return { 
-    agentMessage: refinement.text,
-    usage: calculateUsageMetrics(session)
-  };
 }
 
 function shouldSummarize(session) {
